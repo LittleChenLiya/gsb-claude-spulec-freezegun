@@ -1,5 +1,11 @@
 from . import config
 from ._async import wrap_coroutine
+from .notifications import (
+    NotificationReceipt,
+    Subscription,
+    TimeChangeEvent,
+    _SubscriptionRegistry,
+)
 import asyncio
 import copyreg
 import dateutil
@@ -505,47 +511,81 @@ class TickingDateTimeFactory:
     def __init__(self, time_to_freeze: datetime.datetime, start: datetime.datetime):
         self.time_to_freeze = time_to_freeze
         self.start = start
+        self._subscriptions = _SubscriptionRegistry()
+
+    def subscribe(self, callback: "Callable[[TimeChangeEvent], Any]") -> Subscription:
+        """Subscribe to explicit ``tick``/``move_to`` changes of this clock.
+
+        The callback is invoked once after an explicit operation actually
+        changes the time, receiving a :class:`TimeChangeEvent`. Reading the
+        time through ``now()`` does not trigger the callback.
+        """
+        return self._subscriptions.subscribe(callback)
 
     def __call__(self) -> datetime.datetime:
         return self.time_to_freeze + (real_datetime.now() - self.start)
 
+    def _move_to(self, target_datetime: _Freezable, operation: str) -> None:
+        old_time = self.time_to_freeze
+        self.start = real_datetime.now()
+        self.time_to_freeze = _parse_time_to_freeze(target_datetime)
+        new_time = self.time_to_freeze
+        if old_time != new_time:
+            self._subscriptions.notify(TimeChangeEvent(old_time, new_time, operation))
+
     def tick(self, delta: Union[datetime.timedelta, float]=datetime.timedelta(seconds=1)) -> datetime.datetime:
         if isinstance(delta, numbers.Integral):
-            self.move_to(self.time_to_freeze + datetime.timedelta(seconds=int(delta)))
+            self._move_to(self.time_to_freeze + datetime.timedelta(seconds=int(delta)), "tick")
         elif isinstance(delta, numbers.Real):
-            self.move_to(self.time_to_freeze + datetime.timedelta(seconds=float(delta)))
+            self._move_to(self.time_to_freeze + datetime.timedelta(seconds=float(delta)), "tick")
         else:
-            self.move_to(self.time_to_freeze + delta)  # type: ignore
+            self._move_to(self.time_to_freeze + delta, "tick")  # type: ignore
         return self.time_to_freeze
 
     def move_to(self, target_datetime: _Freezable) -> None:
         """Moves frozen date to the given ``target_datetime``"""
-        self.start = real_datetime.now()
-        self.time_to_freeze = _parse_time_to_freeze(target_datetime)
+        self._move_to(target_datetime, "move_to")
 
 
 class FrozenDateTimeFactory:
 
     def __init__(self, time_to_freeze: datetime.datetime):
         self.time_to_freeze = time_to_freeze
+        self._subscriptions = _SubscriptionRegistry()
+
+    def subscribe(self, callback: "Callable[[TimeChangeEvent], Any]") -> Subscription:
+        """Subscribe to explicit ``tick``/``move_to`` changes of this clock.
+
+        The callback is invoked once after an explicit operation actually
+        changes the time, receiving a :class:`TimeChangeEvent`. Reading the
+        time through ``now()`` does not trigger the callback.
+        """
+        return self._subscriptions.subscribe(callback)
 
     def __call__(self) -> datetime.datetime:
         return self.time_to_freeze
 
+    def _advance(self, delta: datetime.timedelta, operation: str) -> None:
+        old_time = self.time_to_freeze
+        self.time_to_freeze += delta
+        new_time = self.time_to_freeze
+        if old_time != new_time:
+            self._subscriptions.notify(TimeChangeEvent(old_time, new_time, operation))
+
     def tick(self, delta: Union[datetime.timedelta, float]=datetime.timedelta(seconds=1)) -> datetime.datetime:
         if isinstance(delta, numbers.Integral):
-            self.move_to(self.time_to_freeze + datetime.timedelta(seconds=int(delta)))
+            self._advance(datetime.timedelta(seconds=int(delta)), "tick")
         elif isinstance(delta, numbers.Real):
-            self.move_to(self.time_to_freeze + datetime.timedelta(seconds=float(delta)))
+            self._advance(datetime.timedelta(seconds=float(delta)), "tick")
         else:
-            self.time_to_freeze += delta  # type: ignore
+            self._advance(delta, "tick")  # type: ignore
         return self.time_to_freeze
 
     def move_to(self, target_datetime: _Freezable) -> None:
         """Moves frozen date to the given ``target_datetime``"""
         target_datetime = _parse_time_to_freeze(target_datetime)
         delta = target_datetime - self.time_to_freeze
-        self.tick(delta=delta)
+        self._advance(delta, "move_to")
 
 
 class StepTickTimeFactory:
@@ -553,11 +593,31 @@ class StepTickTimeFactory:
     def __init__(self, time_to_freeze: datetime.datetime, step_width: float):
         self.time_to_freeze = time_to_freeze
         self.step_width = step_width
+        self._subscriptions = _SubscriptionRegistry()
+
+    def subscribe(self, callback: "Callable[[TimeChangeEvent], Any]") -> Subscription:
+        """Subscribe to explicit ``tick``/``move_to`` changes of this clock.
+
+        The callback is invoked once after an explicit operation actually
+        changes the time, receiving a :class:`TimeChangeEvent`. The automatic
+        step taken when reading the time through ``now()`` does not trigger
+        the callback.
+        """
+        return self._subscriptions.subscribe(callback)
 
     def __call__(self) -> datetime.datetime:
         return_time = self.time_to_freeze
-        self.tick()
+        # The automatic step on read is *not* an explicit operation, so it
+        # must not emit a time-change event.
+        self.time_to_freeze += datetime.timedelta(seconds=self.step_width)
         return return_time
+
+    def _advance(self, delta: datetime.timedelta, operation: Optional[str]) -> None:
+        old_time = self.time_to_freeze
+        self.time_to_freeze += delta
+        new_time = self.time_to_freeze
+        if operation is not None and old_time != new_time:
+            self._subscriptions.notify(TimeChangeEvent(old_time, new_time, operation))
 
     def tick(self, delta: Union[datetime.timedelta, float, None]=None) -> datetime.datetime:
         if not delta:
@@ -566,7 +626,8 @@ class StepTickTimeFactory:
             delta = datetime.timedelta(seconds=int(delta))
         elif isinstance(delta, numbers.Real):
             delta = datetime.timedelta(seconds=float(delta))
-        self.time_to_freeze += delta  # type: ignore
+        assert isinstance(delta, datetime.timedelta)
+        self._advance(delta, "tick")
         return self.time_to_freeze
 
     def update_step_width(self, step_width: float) -> None:
@@ -576,7 +637,7 @@ class StepTickTimeFactory:
         """Moves frozen date to the given ``target_datetime``"""
         target_datetime = _parse_time_to_freeze(target_datetime)
         delta = target_datetime - self.time_to_freeze
-        self.tick(delta=delta)
+        self._advance(delta, "move_to")
 
 
 class _freeze_time:

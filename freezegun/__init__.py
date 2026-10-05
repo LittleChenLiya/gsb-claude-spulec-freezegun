@@ -7,6 +7,11 @@ freezegun
 """
 from .api import freeze_time
 from .config import configure
+from .notifications import (
+    NotificationReceipt,
+    Subscription,
+    TimeChangeEvent,
+)
 
 __title__ = 'freezegun'
 __version__ = '1.5.5'
@@ -15,4 +20,4 @@ __license__ = 'Apache License 2.0'
 __copyright__ = 'Copyright 2012 Steve Pulec'
 
 
-__all__ = ["freeze_time", "configure"]
+__all__ = ["freeze_time", "configure", "TimeChangeEvent", "Subscription", "NotificationReceipt"]
