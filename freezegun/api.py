@@ -5,7 +5,9 @@ import copyreg
 import dateutil
 import datetime
 import functools
+import itertools
 import sys
+import threading
 import time
 import uuid
 import calendar
@@ -16,7 +18,7 @@ import types
 import numbers
 import inspect
 from typing import TYPE_CHECKING, overload
-from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set, Type, TypeVar, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, NamedTuple, Optional, Set, Type, TypeVar, Tuple, Union
 
 from dateutil import parser
 from dateutil.tz import tzlocal
@@ -500,9 +502,112 @@ def _parse_tz_offset(tz_offset: Union[datetime.timedelta, float]) -> datetime.ti
         return datetime.timedelta(hours=tz_offset)
 
 
-class TickingDateTimeFactory:
+class ClockEvent(NamedTuple):
+    """A single notification emitted by a frozen clock after its time changed.
+
+    Emitted exactly once per ``tick()``/``move_to()`` call that actually
+    changed the frozen time. Never emitted for plain ``now()`` reads.
+
+    Attributes:
+        clock_id (int): Identity of the frozen clock that changed. Nested
+            ``freeze_time`` blocks get their own clock with its own id.
+        operation (str): The operation category, ``"tick"`` or ``"move_to"``.
+        old (datetime.datetime): The frozen instant before the operation.
+        new (datetime.datetime): The frozen instant after the operation.
+    """
+    clock_id: int
+    operation: str
+    old: datetime.datetime
+    new: datetime.datetime
+
+
+class CallbackFailure(NamedTuple):
+    """An independent receipt for one failed subscriber callback.
+
+    A failing callback never rolls back the already-advanced time and does
+    not prevent other subscribers from being notified; each failure is
+    recorded as its own receipt in the clock's ``failures`` list.
+    """
+    clock_id: int
+    event: ClockEvent
+    callback: "Callable[[ClockEvent], None]"
+    exception: Exception
+
+
+_clock_id_counter = itertools.count(1)
+
+
+class _SubscribableClock:
+    """Base class giving a frozen clock an explicit change-subscription API.
+
+    Subscribers are notified exactly once after a ``tick()`` or ``move_to()``
+    call actually changed the frozen time. Callbacks are invoked outside the
+    internal lock, so a callback may freely re-enter ``now()`` without
+    deadlocking. Each clock instance (including every nested ``freeze_time``)
+    has its own independent identity and subscriber list.
+    """
+
+    def __init__(self) -> None:
+        self._clock_id = next(_clock_id_counter)
+        self._clock_lock = threading.RLock()
+        self._subscribers: Dict[int, "Callable[[ClockEvent], None]"] = {}
+        self._next_subscription_token = 0
+        self.failures: List[CallbackFailure] = []
+
+    @property
+    def clock_id(self) -> int:
+        """The unique identity of this frozen clock."""
+        return self._clock_id
+
+    def subscribe(self, callback: "Callable[[ClockEvent], None]") -> int:
+        """Register ``callback`` to be called with a :class:`ClockEvent` after
+        each ``tick()``/``move_to()`` that actually changes the frozen time.
+
+        Returns an opaque token usable with :meth:`unsubscribe`.
+        """
+        with self._clock_lock:
+            token = self._next_subscription_token
+            self._next_subscription_token += 1
+            self._subscribers[token] = callback
+        return token
+
+    def unsubscribe(self, token: int) -> bool:
+        """Remove a previously registered callback. Returns ``True`` if the
+        token was still registered. Unsubscribing before an operation starts
+        guarantees the callback is not invoked for that operation."""
+        with self._clock_lock:
+            return self._subscribers.pop(token, None) is not None
+
+    def _snapshot_subscribers(self) -> "List[Callable[[ClockEvent], None]]":
+        # Must be called with ``self._clock_lock`` held, at the moment the
+        # operation starts: a callback unsubscribed before this point is
+        # guaranteed not to be called for this operation.
+        return list(self._subscribers.values())
+
+    def _emit(self, operation: str, old: datetime.datetime, new: datetime.datetime,
+              subscribers: "List[Callable[[ClockEvent], None]]") -> None:
+        # Only notify when the operation actually changed the time, and never
+        # for plain now() reads.
+        if old == new or not subscribers:
+            return
+        event = ClockEvent(clock_id=self._clock_id, operation=operation, old=old, new=new)
+        # Callbacks run outside the internal lock so they may re-enter now().
+        for callback in subscribers:
+            try:
+                callback(event)
+            except Exception as exc:
+                # A failing callback must not roll back the already-advanced
+                # time; record an independent receipt and keep notifying.
+                receipt = CallbackFailure(clock_id=self._clock_id, event=event,
+                                          callback=callback, exception=exc)
+                with self._clock_lock:
+                    self.failures.append(receipt)
+
+
+class TickingDateTimeFactory(_SubscribableClock):
 
     def __init__(self, time_to_freeze: datetime.datetime, start: datetime.datetime):
+        super().__init__()
         self.time_to_freeze = time_to_freeze
         self.start = start
 
@@ -511,22 +616,34 @@ class TickingDateTimeFactory:
 
     def tick(self, delta: Union[datetime.timedelta, float]=datetime.timedelta(seconds=1)) -> datetime.datetime:
         if isinstance(delta, numbers.Integral):
-            self.move_to(self.time_to_freeze + datetime.timedelta(seconds=int(delta)))
+            delta = datetime.timedelta(seconds=int(delta))
         elif isinstance(delta, numbers.Real):
-            self.move_to(self.time_to_freeze + datetime.timedelta(seconds=float(delta)))
-        else:
-            self.move_to(self.time_to_freeze + delta)  # type: ignore
-        return self.time_to_freeze
+            delta = datetime.timedelta(seconds=float(delta))
+        with self._clock_lock:
+            subscribers = self._snapshot_subscribers()
+            old = self.time_to_freeze
+            self.start = real_datetime.now()
+            self.time_to_freeze = old + delta  # type: ignore
+            new = self.time_to_freeze
+        self._emit("tick", old, new, subscribers)
+        return new
 
     def move_to(self, target_datetime: _Freezable) -> None:
         """Moves frozen date to the given ``target_datetime``"""
-        self.start = real_datetime.now()
-        self.time_to_freeze = _parse_time_to_freeze(target_datetime)
+        target_datetime = _parse_time_to_freeze(target_datetime)
+        with self._clock_lock:
+            subscribers = self._snapshot_subscribers()
+            old = self.time_to_freeze
+            self.start = real_datetime.now()
+            self.time_to_freeze = target_datetime
+            new = self.time_to_freeze
+        self._emit("move_to", old, new, subscribers)
 
 
-class FrozenDateTimeFactory:
+class FrozenDateTimeFactory(_SubscribableClock):
 
     def __init__(self, time_to_freeze: datetime.datetime):
+        super().__init__()
         self.time_to_freeze = time_to_freeze
 
     def __call__(self) -> datetime.datetime:
@@ -534,29 +651,41 @@ class FrozenDateTimeFactory:
 
     def tick(self, delta: Union[datetime.timedelta, float]=datetime.timedelta(seconds=1)) -> datetime.datetime:
         if isinstance(delta, numbers.Integral):
-            self.move_to(self.time_to_freeze + datetime.timedelta(seconds=int(delta)))
+            delta = datetime.timedelta(seconds=int(delta))
         elif isinstance(delta, numbers.Real):
-            self.move_to(self.time_to_freeze + datetime.timedelta(seconds=float(delta)))
-        else:
-            self.time_to_freeze += delta  # type: ignore
-        return self.time_to_freeze
+            delta = datetime.timedelta(seconds=float(delta))
+        with self._clock_lock:
+            subscribers = self._snapshot_subscribers()
+            old = self.time_to_freeze
+            self.time_to_freeze = old + delta  # type: ignore
+            new = self.time_to_freeze
+        self._emit("tick", old, new, subscribers)
+        return new
 
     def move_to(self, target_datetime: _Freezable) -> None:
         """Moves frozen date to the given ``target_datetime``"""
         target_datetime = _parse_time_to_freeze(target_datetime)
-        delta = target_datetime - self.time_to_freeze
-        self.tick(delta=delta)
+        with self._clock_lock:
+            subscribers = self._snapshot_subscribers()
+            old = self.time_to_freeze
+            self.time_to_freeze = target_datetime
+            new = self.time_to_freeze
+        self._emit("move_to", old, new, subscribers)
 
 
-class StepTickTimeFactory:
+class StepTickTimeFactory(_SubscribableClock):
 
     def __init__(self, time_to_freeze: datetime.datetime, step_width: float):
+        super().__init__()
         self.time_to_freeze = time_to_freeze
         self.step_width = step_width
 
     def __call__(self) -> datetime.datetime:
-        return_time = self.time_to_freeze
-        self.tick()
+        with self._clock_lock:
+            return_time = self.time_to_freeze
+            # The implicit per-read step is not a tick()/move_to() operation,
+            # so it must not notify subscribers.
+            self.time_to_freeze += datetime.timedelta(seconds=self.step_width)
         return return_time
 
     def tick(self, delta: Union[datetime.timedelta, float, None]=None) -> datetime.datetime:
@@ -566,8 +695,13 @@ class StepTickTimeFactory:
             delta = datetime.timedelta(seconds=int(delta))
         elif isinstance(delta, numbers.Real):
             delta = datetime.timedelta(seconds=float(delta))
-        self.time_to_freeze += delta  # type: ignore
-        return self.time_to_freeze
+        with self._clock_lock:
+            subscribers = self._snapshot_subscribers()
+            old = self.time_to_freeze
+            self.time_to_freeze = old + delta  # type: ignore
+            new = self.time_to_freeze
+        self._emit("tick", old, new, subscribers)
+        return new
 
     def update_step_width(self, step_width: float) -> None:
         self.step_width = step_width
@@ -575,8 +709,12 @@ class StepTickTimeFactory:
     def move_to(self, target_datetime: _Freezable) -> None:
         """Moves frozen date to the given ``target_datetime``"""
         target_datetime = _parse_time_to_freeze(target_datetime)
-        delta = target_datetime - self.time_to_freeze
-        self.tick(delta=delta)
+        with self._clock_lock:
+            subscribers = self._snapshot_subscribers()
+            old = self.time_to_freeze
+            self.time_to_freeze = target_datetime
+            new = self.time_to_freeze
+        self._emit("move_to", old, new, subscribers)
 
 
 class _freeze_time:

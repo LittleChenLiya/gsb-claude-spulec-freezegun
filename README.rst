@@ -231,6 +231,36 @@ FreezeGun allows moving time to specific dates.
 
 Parameter for ``move_to`` can be any valid ``freeze_time`` date (string, date, datetime).
 
+Subscribing to clock changes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The frozen clock returned by ``freeze_time`` offers an explicit subscription
+interface. Subscribers are notified exactly once after a ``tick()`` or
+``move_to()`` call that actually changed the frozen time — never for plain
+``datetime.datetime.now()`` reads. Each notification is a ``ClockEvent``
+carrying the clock identity, the operation category (``"tick"`` or
+``"move_to"``) and the old/new instants. Callbacks run outside the internal
+clock lock, so a callback may freely call ``now()`` itself. A failing
+callback never rolls back the already-advanced time; each failure is
+recorded as an independent ``CallbackFailure`` receipt in ``clock.failures``.
+Nested ``freeze_time`` blocks each get their own clock with an independent
+identity and subscriber list.
+
+.. code-block:: python
+
+    def test_clock_subscription():
+        with freeze_time("2020-01-01 00:00:00") as clock:
+            events = []
+            token = clock.subscribe(events.append)    # 1. subscribe
+            clock.tick(datetime.timedelta(seconds=5))  # 2. tick -> one "tick" event
+            clock.move_to("2020-01-02 00:00:00")      # 3. move_to -> one "move_to" event
+            clock.unsubscribe(token)                  # 4. unsubscribe -> no more events
+            clock.tick()                              # not delivered
+
+            assert [event.operation for event in events] == ["tick", "move_to"]
+            assert events[0].old == datetime.datetime(2020, 1, 1, 0, 0, 0)
+            assert events[0].new == datetime.datetime(2020, 1, 1, 0, 0, 5)
+
 ``real_asyncio`` parameter
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 

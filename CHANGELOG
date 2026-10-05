@@ -1,6 +1,15 @@
 Freezegun Changelog
 ===================
 
+Unreleased
+----------
+ * Added an explicit frozen-clock subscription interface: ``clock.subscribe(callback)``
+   notifies once per ``tick()``/``move_to()`` that actually changed the time, with a
+   ``ClockEvent`` carrying the clock identity, operation category and old/new instants.
+   Callbacks run outside the internal lock, each nested freeze has an independent clock
+   identity, and callback failures are recorded as independent ``CallbackFailure``
+   receipts in ``clock.failures`` without rolling back the advanced time.
+
 1.5.5
 -----
  * Allow parametrized arguments called 'func' (Broken in 1.5.4)
