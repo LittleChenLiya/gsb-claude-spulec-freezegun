@@ -6,6 +6,7 @@ import dateutil
 import datetime
 import functools
 import sys
+import threading
 import time
 import uuid
 import calendar
@@ -73,6 +74,87 @@ freeze_factories: List[Union["StepTickTimeFactory", "TickingDateTimeFactory", "F
 tz_offsets: List[datetime.timedelta] = []
 ignore_lists: List[Tuple[str, ...]] = []
 tick_flags: List[bool] = []
+
+
+class _ThreadFreezeEntry:
+    """Bookkeeping for a single thread-scoped freeze.
+
+    Wall-clock time (``time.time``, ``datetime.now``, ...) is frozen for the
+    owning thread only.  Monotonic timers follow a separate policy: they keep
+    advancing with the real monotonic clock (anchored at the frozen wall
+    clock value when the freeze started) and never move backwards, even if
+    the frozen wall clock is moved backwards.  The system clock is never
+    touched; only Python-level references are patched.
+    """
+
+    __slots__ = (
+        "factory", "tz_offset", "tick", "ignore",
+        "monotonic_base", "monotonic_real_anchor", "last_monotonic",
+    )
+
+    def __init__(
+        self,
+        factory: Union["StepTickTimeFactory", "TickingDateTimeFactory", "FrozenDateTimeFactory"],
+        tz_offset: datetime.timedelta,
+        tick: bool,
+        ignore: Tuple[str, ...],
+    ):
+        self.factory = factory
+        self.tz_offset = tz_offset
+        self.tick = tick
+        self.ignore = ignore
+        frozen_now = factory()
+        self.monotonic_base = (
+            calendar.timegm(frozen_now.timetuple()) +
+            frozen_now.microsecond / 1e6
+        )
+        self.monotonic_real_anchor = real_monotonic()
+        self.last_monotonic = self.monotonic_base
+
+    def monotonic(self) -> float:
+        # Monotonic policy is decoupled from the (possibly frozen or
+        # backwards-moving) wall clock: advance with the real monotonic
+        # clock and clamp so the value can never go backwards.
+        value = self.monotonic_base + (real_monotonic() - self.monotonic_real_anchor)
+        if value < self.last_monotonic:
+            value = self.last_monotonic
+        self.last_monotonic = value
+        return value
+
+
+# Registry of thread-scoped freezes, keyed by thread id.  Each thread owns
+# its own stack so nested freezes restore by owner, and threads that never
+# registered keep seeing the real (injected) clock.  The global freeze
+# stacks above are never touched by thread-scoped freezes, so other threads
+# are not polluted.
+_thread_freeze_lock = threading.RLock()
+_thread_freeze_stacks: Dict[int, List[_ThreadFreezeEntry]] = {}
+_thread_scoped_count = 0
+
+
+def _current_thread_freeze_stack() -> Optional[List[_ThreadFreezeEntry]]:
+    if not _thread_freeze_stacks:
+        return None
+    stack = _thread_freeze_stacks.get(threading.get_ident())
+    return stack or None
+
+
+class _PatchState:
+    """Bookkeeping for the globally installed patches.
+
+    Shared by the default (global) freeze mode and the thread-scoped mode so
+    that patches are installed on the first freeze of any kind and removed
+    only when the last freeze of any kind stops.
+    """
+
+    def __init__(self) -> None:
+        self.undo_changes: List[Tuple[types.ModuleType, str, Any]] = []
+        self.modules_at_start: Set[str] = set()
+        self.fake_names: Tuple[str, ...] = ()
+        self.reals: Dict[int, Any] = {}
+
+
+_patch_state: Optional[_PatchState] = None
 
 try:
     # noinspection PyUnresolvedReferences
@@ -157,21 +239,30 @@ call_stack_inspection_limit = 5
 
 
 def _should_use_real_time() -> bool:
-    if not call_stack_inspection_limit:
-        return False
+    thread_stack = _current_thread_freeze_stack()
 
-    # Means stop() has already been called, so we can now return the real time
-    if not ignore_lists:
+    if not call_stack_inspection_limit:
+        # Call stack inspection is disabled.  Only fake the time when a
+        # freeze actually applies to this thread; unregistered threads must
+        # keep seeing the real clock.
+        return thread_stack is None and not freeze_factories
+
+    if thread_stack is not None:
+        ignore = thread_stack[-1].ignore
+    elif ignore_lists:
+        ignore = ignore_lists[-1]
+    else:
+        # Means stop() has already been called, so we can now return the real time
         return True
 
-    if not ignore_lists[-1]:
+    if not ignore:
         return False
 
     frame = inspect.currentframe().f_back.f_back  # type: ignore
 
     for _ in range(call_stack_inspection_limit):
         module_name = frame.f_globals.get('__name__')  # type: ignore
-        if module_name and module_name.startswith(ignore_lists[-1]):
+        if module_name and module_name.startswith(ignore):
             return True
 
         frame = frame.f_back  # type: ignore
@@ -182,7 +273,20 @@ def _should_use_real_time() -> bool:
 
 
 def get_current_time() -> datetime.datetime:
+    thread_stack = _current_thread_freeze_stack()
+    if thread_stack is not None:
+        return thread_stack[-1].factory()
     return freeze_factories[-1]()
+
+
+def _get_tz_offset() -> datetime.timedelta:
+    thread_stack = _current_thread_freeze_stack()
+    if thread_stack is not None:
+        return thread_stack[-1].tz_offset
+    if tz_offsets:
+        return tz_offsets[-1]
+    # No freeze applies to this thread: no offset.
+    return datetime.timedelta(0)
 
 
 def fake_time() -> float:
@@ -217,6 +321,11 @@ def fake_gmtime(t: Optional[float]=None) -> time.struct_time:
 
 def _get_fake_monotonic() -> float:
     # For monotonic timers like .monotonic(), .perf_counter(), etc
+    thread_stack = _current_thread_freeze_stack()
+    if thread_stack is not None:
+        # Thread-scoped freezes use a dedicated monotonic policy that never
+        # goes backwards, independent of the frozen wall clock.
+        return thread_stack[-1].monotonic()
     current_time = get_current_time()
     return (
         calendar.timegm(current_time.timetuple()) +
@@ -226,6 +335,9 @@ def _get_fake_monotonic() -> float:
 
 def _get_fake_monotonic_ns() -> int:
     # For monotonic timers like .monotonic(), .perf_counter(), etc
+    thread_stack = _current_thread_freeze_stack()
+    if thread_stack is not None:
+        return int(thread_stack[-1].monotonic() * 1e9)
     current_time = get_current_time()
     return (
         calendar.timegm(current_time.timetuple()) * 1000000 +
@@ -346,7 +458,7 @@ class FakeDate(real_date, metaclass=FakeDateMeta):
 
     @classmethod
     def _tz_offset(cls) -> datetime.timedelta:
-        return tz_offsets[-1]
+        return _get_tz_offset()
 
 FakeDate.min = date_to_fakedate(real_date.min)
 FakeDate.max = date_to_fakedate(real_date.max)
@@ -428,13 +540,13 @@ class FakeDatetime(real_datetime, FakeDate, metaclass=FakeDatetimeMeta):
 
     @staticmethod
     def _time_to_freeze() -> Optional[datetime.datetime]:
-        if freeze_factories:
+        if freeze_factories or _current_thread_freeze_stack():
             return get_current_time()
         return None
 
     @classmethod
     def _tz_offset(cls) -> datetime.timedelta:
-        return tz_offsets[-1]
+        return _get_tz_offset()
 
 
 FakeDatetime.min = datetime_to_fakedatetime(real_datetime.min)
@@ -598,6 +710,7 @@ class _freeze_time:
         as_arg (bool): Whether to pass the frozen time as an argument to the decorated function.
         as_kwarg (str): The name of the keyword argument to pass the frozen time to the decorated function.
         real_asyncio (Optional[bool]): Whether to allow asyncio event loops to see real monotonic time.
+        thread_scoped (bool): Whether the freeze only applies to the thread that started it.
 
     Methods:
         __call__(func): Decorates a function or class to freeze time during its execution.
@@ -620,6 +733,7 @@ class _freeze_time:
         as_kwarg: str,
         auto_tick_seconds: float,
         real_asyncio: Optional[bool],
+        thread_scoped: bool = False,
     ):
         self.time_to_freeze = _parse_time_to_freeze(time_to_freeze_str)
         self.tz_offset = _parse_tz_offset(tz_offset)
@@ -631,6 +745,8 @@ class _freeze_time:
         self.as_arg = as_arg
         self.as_kwarg = as_kwarg
         self.real_asyncio = real_asyncio
+        self.thread_scoped = thread_scoped
+        self._thread_entry: Optional[_ThreadFreezeEntry] = None
 
     # mypy objects to this because Type is Callable, but Pytype needs it because
     # (unlike mypy's) its inference does not assume class decorators always leave
@@ -741,6 +857,7 @@ class _freeze_time:
         self.stop()
 
     def start(self) -> Union[StepTickTimeFactory, TickingDateTimeFactory, FrozenDateTimeFactory]:
+        global _patch_state, _thread_scoped_count
 
         if self.auto_tick_seconds:
             freeze_factory: Union[StepTickTimeFactory, TickingDateTimeFactory, FrozenDateTimeFactory] = StepTickTimeFactory(self.time_to_freeze, self.auto_tick_seconds)
@@ -749,15 +866,33 @@ class _freeze_time:
         else:
             freeze_factory = FrozenDateTimeFactory(self.time_to_freeze)
 
-        is_already_started = len(freeze_factories) > 0
-        freeze_factories.append(freeze_factory)
-        tz_offsets.append(self.tz_offset)
-        ignore_lists.append(self.ignore)
-        tick_flags.append(self.tick)
+        # The registration and the patch install must be atomic: freezes in
+        # different threads may start concurrently.
+        with _thread_freeze_lock:
+            if self.thread_scoped:
+                # Thread-scoped mode: register the freeze on the current
+                # thread only.  The global freeze stacks are left untouched
+                # so other threads keep seeing the real (injected) clock.
+                entry = _ThreadFreezeEntry(freeze_factory, self.tz_offset, self.tick, self.ignore)
+                _thread_freeze_stacks.setdefault(threading.get_ident(), []).append(entry)
+                _thread_scoped_count += 1
+                self._thread_entry = entry
+            else:
+                freeze_factories.append(freeze_factory)
+                tz_offsets.append(self.tz_offset)
+                ignore_lists.append(self.ignore)
+                tick_flags.append(self.tick)
 
-        if is_already_started:
-            return freeze_factory
+            if _patch_state is not None:
+                # Patches are already installed by another active freeze.
+                return freeze_factory
 
+            _patch_state = _PatchState()
+            self._install_patches(_patch_state)
+
+        return freeze_factory
+
+    def _install_patches(self, patch_state: _PatchState) -> None:
         # Change the modules
         datetime.datetime = FakeDatetime  # type: ignore[misc]
         datetime.date = FakeDate  # type: ignore[misc]
@@ -808,10 +943,12 @@ class _freeze_time:
         self.fake_names = tuple(fake.__name__ for real_name, real, fake in to_patch)  # type: ignore
         self.reals = {id(fake): real for real_name, real, fake in to_patch}
         fakes = {id(real): fake for real_name, real, fake in to_patch}
-        add_change = self.undo_changes.append
+        patch_state.fake_names = self.fake_names
+        patch_state.reals = self.reals
+        add_change = patch_state.undo_changes.append
 
         # Save the current loaded modules
-        self.modules_at_start = set(sys.modules.keys())
+        patch_state.modules_at_start = set(sys.modules.keys())
 
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore')
@@ -847,71 +984,98 @@ class _freeze_time:
             add_change((EventLoopClass, "time", EventLoopClass.time))  # type: ignore
             EventLoopClass.time = lambda self: real_monotonic()  # type: ignore[method-assign]
 
-        return freeze_factory
-
     def stop(self) -> None:
-        freeze_factories.pop()
-        ignore_lists.pop()
-        tick_flags.pop()
-        tz_offsets.pop()
+        global _patch_state, _thread_scoped_count
 
-        if not freeze_factories:
-            datetime.datetime = real_datetime  # type: ignore[misc]
-            datetime.date = real_date  # type: ignore[misc]
-            copyreg.dispatch_table.pop(real_datetime)
-            copyreg.dispatch_table.pop(real_date)
-            for module_or_object, attribute, original_value in self.undo_changes:
-                setattr(module_or_object, attribute, original_value)
-            self.undo_changes = []
+        # The de-registration and the patch uninstall must be atomic: freezes
+        # in different threads may stop concurrently.
+        with _thread_freeze_lock:
+            if self.thread_scoped:
+                # Nested freezes restore by owner: remove exactly the entry
+                # this freeze registered on the current thread, leaving any
+                # outer entries (and other threads' entries) untouched.
+                entry = self._thread_entry
+                if entry is not None:
+                    stack = _thread_freeze_stacks.get(threading.get_ident())
+                    if stack and entry in stack:
+                        stack.remove(entry)
+                        _thread_scoped_count -= 1
+                        if not stack:
+                            del _thread_freeze_stacks[threading.get_ident()]
+                    self._thread_entry = None
+            else:
+                freeze_factories.pop()
+                ignore_lists.pop()
+                tick_flags.pop()
+                tz_offsets.pop()
 
-            # Restore modules loaded after start()
-            modules_to_restore = set(sys.modules.keys()) - self.modules_at_start
-            self.modules_at_start = set()
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore')
-                for mod_name in modules_to_restore:
-                    module = sys.modules.get(mod_name, None)
-                    if mod_name is None or module is None:
+            if freeze_factories or _thread_scoped_count:
+                # Other freezes (global or thread-scoped) are still active.
+                return
+
+            patch_state = _patch_state
+            if patch_state is None:
+                return
+            _patch_state = None
+            self._restore_patches(patch_state)
+
+    def _restore_patches(self, patch_state: _PatchState) -> None:
+        datetime.datetime = real_datetime  # type: ignore[misc]
+        datetime.date = real_date  # type: ignore[misc]
+        copyreg.dispatch_table.pop(real_datetime)
+        copyreg.dispatch_table.pop(real_date)
+        for module_or_object, attribute, original_value in patch_state.undo_changes:
+            setattr(module_or_object, attribute, original_value)
+        patch_state.undo_changes = []
+
+        # Restore modules loaded after start()
+        modules_to_restore = set(sys.modules.keys()) - patch_state.modules_at_start
+        patch_state.modules_at_start = set()
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            for mod_name in modules_to_restore:
+                module = sys.modules.get(mod_name, None)
+                if mod_name is None or module is None:
+                    continue
+                elif mod_name.startswith(self.ignore) or mod_name.endswith('.six.moves'):
+                    continue
+                elif not hasattr(module, "__name__") or module.__name__ in ('datetime', 'time'):
+                    continue
+                for module_attribute in dir(module):
+
+                    if module_attribute in patch_state.fake_names:
                         continue
-                    elif mod_name.startswith(self.ignore) or mod_name.endswith('.six.moves'):
+                    try:
+                        attribute_value = getattr(module, module_attribute)
+                    except (ImportError, AttributeError, TypeError):
+                        # For certain libraries, this can result in ImportError(_winreg) or AttributeError (celery)
                         continue
-                    elif not hasattr(module, "__name__") or module.__name__ in ('datetime', 'time'):
-                        continue
-                    for module_attribute in dir(module):
 
-                        if module_attribute in self.fake_names:
-                            continue
-                        try:
-                            attribute_value = getattr(module, module_attribute)
-                        except (ImportError, AttributeError, TypeError):
-                            # For certain libraries, this can result in ImportError(_winreg) or AttributeError (celery)
-                            continue
+                    real = patch_state.reals.get(id(attribute_value))
+                    if real:
+                        setattr(module, module_attribute, real)
 
-                        real = self.reals.get(id(attribute_value))
-                        if real:
-                            setattr(module, module_attribute, real)
+        time.time = real_time
+        time.monotonic = real_monotonic
+        time.perf_counter = real_perf_counter
+        time.gmtime = real_gmtime
+        time.localtime = real_localtime
+        time.strftime = real_strftime
+        time.clock = real_clock  # type: ignore[attr-defined]
 
-            time.time = real_time
-            time.monotonic = real_monotonic
-            time.perf_counter = real_perf_counter
-            time.gmtime = real_gmtime
-            time.localtime = real_localtime
-            time.strftime = real_strftime
-            time.clock = real_clock  # type: ignore[attr-defined]
+        if _TIME_NS_PRESENT:
+            time.time_ns = real_time_ns
 
-            if _TIME_NS_PRESENT:
-                time.time_ns = real_time_ns
+        if _MONOTONIC_NS_PRESENT:
+            time.monotonic_ns = real_monotonic_ns
 
-            if _MONOTONIC_NS_PRESENT:
-                time.monotonic_ns = real_monotonic_ns
+        if _PERF_COUNTER_NS_PRESENT:
+            time.perf_counter_ns = real_perf_counter_ns
 
-            if _PERF_COUNTER_NS_PRESENT:
-                time.perf_counter_ns = real_perf_counter_ns
-
-            if uuid_generate_time_attr:
-                setattr(uuid, uuid_generate_time_attr, real_uuid_generate_time)
-            uuid._UuidCreate = real_uuid_create  # type: ignore[attr-defined]
-            uuid._last_timestamp = None  # type: ignore[attr-defined]
+        if uuid_generate_time_attr:
+            setattr(uuid, uuid_generate_time_attr, real_uuid_generate_time)
+        uuid._UuidCreate = real_uuid_create  # type: ignore[attr-defined]
+        uuid._last_timestamp = None  # type: ignore[attr-defined]
 
     def decorate_coroutine(self, coroutine: "Callable[P, Awaitable[T]]") -> "Callable[P, Awaitable[T]]":
         return wrap_coroutine(self, coroutine)
@@ -954,7 +1118,7 @@ class _freeze_time:
 
 
 def freeze_time(time_to_freeze: Optional[_Freezable]=None, tz_offset: Union[int, datetime.timedelta]=0, ignore: Optional[List[str]]=None, tick: bool=False, as_arg: bool=False, as_kwarg: str='',
-                auto_tick_seconds: float=0, real_asyncio: bool=False) -> _freeze_time:
+                auto_tick_seconds: float=0, real_asyncio: bool=False, thread_scoped: bool=False) -> _freeze_time:
     """
     Freezes time for testing purposes.
 
@@ -971,6 +1135,10 @@ def freeze_time(time_to_freeze: Optional[_Freezable]=None, tz_offset: Union[int,
         as_kwarg (str): The name of the keyword argument to pass the frozen time to the decorated function.
         auto_tick_seconds (float): The number of seconds to auto-tick the frozen time.
         real_asyncio (bool): Whether to allow asyncio event loops to see real monotonic time.
+        thread_scoped (bool): Whether the freeze only applies to the thread that started it.
+            When enabled, other threads keep seeing the real (injected) clock, nested
+            freezes restore by owner, and monotonic timers never move backwards even
+            if the frozen wall clock does. The system clock is never modified.
 
     Returns:
         _freeze_time: An instance of the _freeze_time class.
@@ -989,14 +1157,14 @@ def freeze_time(time_to_freeze: Optional[_Freezable]=None, tz_offset: Union[int,
         raise SystemError('Calling freeze_time with tick=True is only compatible with CPython')
 
     if isinstance(time_to_freeze, types.FunctionType):
-        return freeze_time(time_to_freeze(), tz_offset, ignore, tick, as_arg, as_kwarg, auto_tick_seconds, real_asyncio=real_asyncio)
+        return freeze_time(time_to_freeze(), tz_offset, ignore, tick, as_arg, as_kwarg, auto_tick_seconds, real_asyncio=real_asyncio, thread_scoped=thread_scoped)
 
     if isinstance(time_to_freeze, types.GeneratorType):
-        return freeze_time(next(time_to_freeze), tz_offset, ignore, tick, as_arg, as_kwarg, auto_tick_seconds, real_asyncio=real_asyncio)
+        return freeze_time(next(time_to_freeze), tz_offset, ignore, tick, as_arg, as_kwarg, auto_tick_seconds, real_asyncio=real_asyncio, thread_scoped=thread_scoped)
 
     if MayaDT is not None and isinstance(time_to_freeze, MayaDT):
         return freeze_time(time_to_freeze.datetime(), tz_offset, ignore,
-                           tick, as_arg, as_kwarg, auto_tick_seconds, real_asyncio=real_asyncio)
+                           tick, as_arg, as_kwarg, auto_tick_seconds, real_asyncio=real_asyncio, thread_scoped=thread_scoped)
 
     if ignore is None:
         ignore = []
@@ -1013,6 +1181,7 @@ def freeze_time(time_to_freeze: Optional[_Freezable]=None, tz_offset: Union[int,
         as_kwarg=as_kwarg,
         auto_tick_seconds=auto_tick_seconds,
         real_asyncio=real_asyncio,
+        thread_scoped=thread_scoped,
     )
 
 

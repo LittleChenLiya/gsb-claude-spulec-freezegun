@@ -1,6 +1,14 @@
 Freezegun Changelog
 ===================
 
+Unreleased
+----------
+ * Add ``thread_scoped`` parameter to ``freeze_time``: freezes time only for the
+   registering thread while other threads keep reading the real clock. Nested
+   freezes restore by owner, exceptions restore the real clock, and monotonic
+   timers never move backwards when the frozen wall clock does. The default
+   global freeze mode is unchanged.
+
 1.5.5
 -----
  * Allow parametrized arguments called 'func' (Broken in 1.5.4)

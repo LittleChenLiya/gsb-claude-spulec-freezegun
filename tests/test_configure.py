@@ -31,6 +31,7 @@ def test_default_ignore_list_is_overridden(ignorelist: List[str]) -> None:
             as_kwarg='',
             auto_tick_seconds=0,
             real_asyncio=False,
+            thread_scoped=False,
         )
 
 
@@ -66,6 +67,7 @@ def test_extend_default_ignore_list(ignorelist: List[str]) -> None:
             as_kwarg='',
             auto_tick_seconds=0,
             real_asyncio=False,
+            thread_scoped=False,
         )
 
 def test_extend_default_ignore_list_duplicate_items() -> None:
@@ -103,4 +105,5 @@ def test_extend_default_ignore_list_duplicate_items() -> None:
             as_kwarg='',
             auto_tick_seconds=0,
             real_asyncio=False,
+            thread_scoped=False,
         )

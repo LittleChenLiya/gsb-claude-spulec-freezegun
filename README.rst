@@ -243,6 +243,30 @@ FreezeGun has an additional ``real_asyncio`` parameter which allows asyncio even
         await asyncio.sleep(1)
         assert datetime.datetime.now() == datetime.datetime(2012, 1, 14)
 
+``thread_scoped`` parameter
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+FreezeGun has an additional ``thread_scoped`` parameter which freezes time only for the thread that started the freeze. Other threads keep reading the real (injected) clock, and the global freeze stack is never touched, so concurrent threads are not polluted. Nested thread-scoped freezes restore by owner, exceptions inside the block still restore the real clock, and monotonic timers (``time.monotonic()``, ``time.perf_counter()`` and their ``_ns`` variants) follow a separate policy from the wall clock: they keep advancing with the real monotonic clock and never move backwards, even if the frozen wall clock is moved backwards. The system clock is never modified. The default (non thread-scoped) mode is unchanged and still freezes time globally.
+
+.. code-block:: python
+
+    import threading
+    import datetime
+    from freezegun import freeze_time
+
+    def frozen_worker():
+        with freeze_time("2012-01-14", thread_scoped=True):
+            assert datetime.datetime.now() == datetime.datetime(2012, 1, 14)
+
+    def real_worker():
+        # This thread still sees the real clock.
+        assert datetime.datetime.now().year != 2012
+
+    threading.Thread(target=frozen_worker).start()
+    threading.Thread(target=real_worker).start()
+
+See ``examples/thread_scoped_demo.py`` for a runnable two-thread demo and ``tests/test_thread_scoped.py`` for the test suite (``python -m pytest tests/test_thread_scoped.py -v``).
+
 API Documentation
 ~~~~~~~~~~~~~~~~~
 
@@ -250,9 +274,9 @@ Here is a succinct API documentation with all options listed:
 
 .. code-block:: python
 
-    freeze_time(time_to_freeze: Optional[_Freezable]=None, tz_offset: Union[int, datetime.timedelta]=0, ignore: Optional[List[str]]=None, tick: bool=False, as_arg: bool=False, as_kwarg: str='', auto_tick_seconds: float=0, real_asyncio: bool=False) -> _freeze_time
+    freeze_time(time_to_freeze: Optional[_Freezable]=None, tz_offset: Union[int, datetime.timedelta]=0, ignore: Optional[List[str]]=None, tick: bool=False, as_arg: bool=False, as_kwarg: str='', auto_tick_seconds: float=0, real_asyncio: bool=False, thread_scoped: bool=False) -> _freeze_time
 
-    _freeze_time(time_to_freeze_str: Optional[_Freezable], tz_offset: Union[int, datetime.timedelta], ignore: List[str], tick: bool, as_arg: bool, as_kwarg: str, auto_tick_seconds: float, real_asyncio: Optional[bool])
+    _freeze_time(time_to_freeze_str: Optional[_Freezable], tz_offset: Union[int, datetime.timedelta], ignore: List[str], tick: bool, as_arg: bool, as_kwarg: str, auto_tick_seconds: float, real_asyncio: Optional[bool], thread_scoped: bool = False)
 
     _freeze_time.start() -> Union[StepTickTimeFactory, TickingDateTimeFactory, FrozenDateTimeFactory]
 
