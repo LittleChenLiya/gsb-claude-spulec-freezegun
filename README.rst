@@ -306,6 +306,48 @@ On Debian systems:
     $ sudo apt-get install python-freezegun
 
 
+Explicit thread-scoped freezes
+------------------------------
+
+By default ``freeze_time`` is process-wide: every thread sees the frozen time.
+Pass ``thread_scoped=True`` to freeze only the *registering thread* (the
+thread that enters the context manager or calls ``start()``). Every other
+("unknown") thread keeps reading the injected real clock, because a scoped
+freeze never pushes anything onto the process-wide freeze stack and therefore
+cannot temporarily pollute another thread.
+
+.. code-block:: python
+
+    import datetime
+    import threading
+    from freezegun import freeze_time
+
+    with freeze_time('2020-01-01 12:00:00', thread_scoped=True):
+        # This thread sees the frozen time.
+        assert datetime.datetime.now() == datetime.datetime(2020, 1, 1, 12)
+
+    # Another thread running concurrently with the block above is completely
+    # unaffected and keeps observing the real clock.
+
+Scoped freezes owned by the same thread can be nested: exiting the inner
+freeze restores the outer freeze, and exiting via an exception restores it as
+well. The wall-clock policy and the monotonic policy are separate: the wall
+clock (``datetime.datetime.now``, ``time.time`` ...) is frozen while
+``time.monotonic`` and ``time.perf_counter`` keep reporting the real,
+non-decreasing clock, so moving the frozen wall clock backwards can never make
+a monotonic timer jump backwards. The operating-system clock itself is never
+modified. The default (process-wide) ``freeze_time`` behavior is unchanged
+when ``thread_scoped`` is omitted or ``False``.
+
+A runnable two-thread demonstration is included in
+``examples/thread_scoped_demo.py`` and the acceptance tests in
+``tests/test_thread_scoped.py`` can be run with:
+
+.. code-block:: bash
+
+    $ python -m pytest tests/test_thread_scoped.py -v
+
+
 Ignore packages
 ---------------
 

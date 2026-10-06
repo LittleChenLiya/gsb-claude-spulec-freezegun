@@ -1,6 +1,16 @@
 Freezegun Changelog
 ===================
 
+Unreleased
+----------
+ * Add explicit thread-scoped freeze mode via ``freeze_time(..., thread_scoped=True)``:
+   only the registering thread's time calls are frozen, other threads keep the
+   injected real clock, the process-wide freeze stack is never touched, nested
+   scoped freezes restore the outer freeze on normal or exceptional exit, and
+   monotonic clocks (``time.monotonic`` / ``time.perf_counter``) stay on the
+   real non-decreasing clock independently of the frozen wall clock. The
+   system clock is never modified and the default freeze behavior is unchanged.
+
 1.5.5
 -----
  * Allow parametrized arguments called 'func' (Broken in 1.5.4)
