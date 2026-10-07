@@ -1016,6 +1016,97 @@ def freeze_time(time_to_freeze: Optional[_Freezable]=None, tz_offset: Union[int,
     )
 
 
+class FrozenSequenceError(RuntimeError):
+    """Raised when a reusable frozen time sequence has no more moments."""
+
+
+class _freeze_time_sequence:
+    """
+    A reusable context manager that freezes time at successive moments.
+
+    Each ``with`` block consumes the next moment from the underlying
+    iterator and freezes time at that moment; on exit the previous (outer)
+    time patch is restored. When the sequence is exhausted, entering the
+    context raises :class:`FrozenSequenceError` *before* any new patch is
+    installed, so an outer ``freeze_time`` stays intact.
+    """
+
+    def __init__(
+        self,
+        moments: Iterator[_Freezable],
+        tz_offset: Union[int, datetime.timedelta],
+        ignore: Optional[List[str]],
+        tick: bool,
+        auto_tick_seconds: float,
+        real_asyncio: Optional[bool],
+    ):
+        self._moments = moments
+        self._tz_offset = tz_offset
+        self._ignore = ignore
+        self._tick = tick
+        self._auto_tick_seconds = auto_tick_seconds
+        self._real_asyncio = real_asyncio
+        self._active: Optional[_freeze_time] = None
+
+    def __enter__(self) -> Union[StepTickTimeFactory, TickingDateTimeFactory, FrozenDateTimeFactory]:
+        try:
+            moment = next(self._moments)
+        except StopIteration:
+            # Fail before installing any new patch, so an outer freeze
+            # (and the real time functions) are left untouched.
+            raise FrozenSequenceError(
+                'freeze_time_sequence() is exhausted: no more moments to freeze at'
+            ) from None
+        freezer = freeze_time(
+            moment,
+            tz_offset=self._tz_offset,
+            ignore=self._ignore,
+            tick=self._tick,
+            auto_tick_seconds=self._auto_tick_seconds,
+            real_asyncio=bool(self._real_asyncio),
+        )
+        factory = freezer.start()
+        self._active = freezer
+        return factory
+
+    def __exit__(self, *args: Any) -> None:
+        freezer, self._active = self._active, None
+        if freezer is not None:
+            freezer.stop()
+
+
+def freeze_time_sequence(moments: Any, tz_offset: Union[int, datetime.timedelta]=0, ignore: Optional[List[str]]=None, tick: bool=False,
+                         auto_tick_seconds: float=0, real_asyncio: bool=False) -> _freeze_time_sequence:
+    """
+    Creates a reusable context manager freezing time at successive moments.
+
+    Unlike ``freeze_time`` (which consumes a single value from a generator),
+    the returned object can be entered once per moment in ``moments``. Each
+    entry freezes time at the next moment; exiting restores the outer time
+    patch. Entering after the sequence is exhausted raises
+    :class:`FrozenSequenceError` before any new patch is installed.
+
+    Args:
+        moments: An iterable of values accepted by ``freeze_time``.
+        tz_offset (Union[int, datetime.timedelta]): The timezone offset to apply.
+        ignore (Optional[List[str]]): A list of module names to ignore when freezing time.
+        tick (bool): Whether to allow time to tick forward.
+        auto_tick_seconds (float): The number of seconds to auto-tick the frozen time.
+        real_asyncio (bool): Whether to allow asyncio event loops to see real monotonic time.
+
+    Returns:
+        _freeze_time_sequence: A reusable context manager.
+    """
+    return _freeze_time_sequence(
+        moments=iter(moments),
+        tz_offset=tz_offset,
+        ignore=ignore,
+        tick=tick,
+        auto_tick_seconds=auto_tick_seconds,
+        real_asyncio=real_asyncio,
+    )
+
+
 # Setup adapters for sqlite
 try:
     # noinspection PyUnresolvedReferences

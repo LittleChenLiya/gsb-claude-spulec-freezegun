@@ -1,6 +1,12 @@
 Freezegun Changelog
 ===================
 
+Unreleased
+----------
+ * Add `freeze_time_sequence`: a reusable context manager that freezes time at
+   successive moments from an iterable, restoring the outer patch on exit and
+   raising `FrozenSequenceError` (before installing any new patch) once exhausted
+
 1.5.5
 -----
  * Allow parametrized arguments called 'func' (Broken in 1.5.4)
