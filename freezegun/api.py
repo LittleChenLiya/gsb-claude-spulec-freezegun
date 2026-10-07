@@ -16,7 +16,7 @@ import types
 import numbers
 import inspect
 from typing import TYPE_CHECKING, overload
-from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set, Type, TypeVar, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Set, Type, TypeVar, Tuple, Union
 
 from dateutil import parser
 from dateutil.tz import tzlocal
@@ -1011,6 +1011,95 @@ def freeze_time(time_to_freeze: Optional[_Freezable]=None, tz_offset: Union[int,
         tick=tick,
         as_arg=as_arg,
         as_kwarg=as_kwarg,
+        auto_tick_seconds=auto_tick_seconds,
+        real_asyncio=real_asyncio,
+    )
+
+
+class FrozenSequence:
+    """
+    A reusable context manager that freezes time at successive moments.
+
+    Each entry (``with`` block) consumes the next moment from the given
+    iterable of times and installs a fresh freeze; exiting restores the
+    previously active time patches, so it nests cleanly inside an outer
+    ``freeze_time`` or another ``FrozenSequence``.
+
+    When the sequence is exhausted, entering raises ``RuntimeError``
+    *before* any new patch is installed, leaving any outer freeze intact.
+
+    Unlike ``freeze_time`` with a generator (which consumes a single value
+    once, at call time), a ``FrozenSequence`` pulls one value per entry and
+    the same object can be entered repeatedly until the sequence runs out.
+    """
+
+    def __init__(
+        self,
+        times: Iterable[_Freezable],
+        tz_offset: Union[int, datetime.timedelta] = 0,
+        ignore: Optional[List[str]] = None,
+        tick: bool = False,
+        auto_tick_seconds: float = 0,
+        real_asyncio: bool = False,
+    ):
+        self._times = iter(times)
+        self._tz_offset = tz_offset
+        self._ignore = ignore
+        self._tick = tick
+        self._auto_tick_seconds = auto_tick_seconds
+        self._real_asyncio = real_asyncio
+        self._active: List["_freeze_time"] = []
+
+    def __enter__(self) -> Union[StepTickTimeFactory, TickingDateTimeFactory, FrozenDateTimeFactory]:
+        try:
+            next_time = next(self._times)
+        except StopIteration:
+            raise RuntimeError(
+                "FrozenSequence is exhausted: no frozen times remain. "
+                "No new time patches were installed; any outer freeze is still in effect."
+            ) from None
+        freezer = freeze_time(
+            next_time,
+            tz_offset=self._tz_offset,
+            ignore=self._ignore,
+            tick=self._tick,
+            auto_tick_seconds=self._auto_tick_seconds,
+            real_asyncio=self._real_asyncio,
+        )
+        freeze_factory = freezer.start()
+        self._active.append(freezer)
+        return freeze_factory
+
+    def __exit__(self, *args: Any) -> None:
+        freezer = self._active.pop()
+        freezer.stop()
+
+
+def freeze_sequence(times: Iterable[_Freezable], tz_offset: Union[int, datetime.timedelta]=0, ignore: Optional[List[str]]=None, tick: bool=False,
+                    auto_tick_seconds: float=0, real_asyncio: bool=False) -> FrozenSequence:
+    """
+    Creates a reusable :class:`FrozenSequence` context manager over ``times``.
+
+    Each ``with`` entry freezes time at the next moment of the sequence;
+    exiting restores the outer time state. Entering after the sequence is
+    exhausted raises ``RuntimeError`` before installing any new patch.
+
+    Args:
+        times (Iterable[_Freezable]): The successive moments to freeze at.
+        tz_offset (Union[int, datetime.timedelta]): The timezone offset to apply.
+        ignore (Optional[List[str]]): A list of module names to ignore when freezing time.
+        tick (bool): Whether to allow time to tick forward.
+        auto_tick_seconds (float): The number of seconds to auto-tick the frozen time.
+        real_asyncio (bool): Whether to allow asyncio event loops to see real monotonic time.
+
+    Returns:
+        FrozenSequence: A reusable context manager over the given times.
+    """
+    return FrozenSequence(
+        times,
+        tz_offset=tz_offset,
+        ignore=ignore,
+        tick=tick,
         auto_tick_seconds=auto_tick_seconds,
         real_asyncio=real_asyncio,
     )
