@@ -73,6 +73,7 @@ freeze_factories: List[Union["StepTickTimeFactory", "TickingDateTimeFactory", "F
 tz_offsets: List[datetime.timedelta] = []
 ignore_lists: List[Tuple[str, ...]] = []
 tick_flags: List[bool] = []
+folds: List[int] = []
 
 try:
     # noinspection PyUnresolvedReferences
@@ -310,7 +311,8 @@ def datetime_to_fakedatetime(datetime: datetime.datetime) -> "FakeDatetime":
                         datetime.minute,
                         datetime.second,
                         datetime.microsecond,
-                        datetime.tzinfo)
+                        datetime.tzinfo,
+                        fold=datetime.fold)
 
 
 def date_to_fakedate(date: datetime.date) -> "FakeDate":
@@ -402,6 +404,9 @@ class FakeDatetime(real_datetime, FakeDate, metaclass=FakeDatetimeMeta):
         now = cls._time_to_freeze() or real_datetime.now()
         if tz:
             result = tz.fromutc(now.replace(tzinfo=tz)) + cls._tz_offset()
+            fold = cls._fold()
+            if fold:
+                result = result.replace(fold=fold)
         else:
             result = now + cls._tz_offset()
         return datetime_to_fakedatetime(result)
@@ -435,6 +440,10 @@ class FakeDatetime(real_datetime, FakeDate, metaclass=FakeDatetimeMeta):
     @classmethod
     def _tz_offset(cls) -> datetime.timedelta:
         return tz_offsets[-1]
+
+    @classmethod
+    def _fold(cls) -> int:
+        return folds[-1]
 
 
 FakeDatetime.min = datetime_to_fakedatetime(real_datetime.min)
@@ -598,6 +607,8 @@ class _freeze_time:
         as_arg (bool): Whether to pass the frozen time as an argument to the decorated function.
         as_kwarg (str): The name of the keyword argument to pass the frozen time to the decorated function.
         real_asyncio (Optional[bool]): Whether to allow asyncio event loops to see real monotonic time.
+        fold (int): The ``fold`` marker captured from the frozen datetime when
+            the ``preserve_fold`` option is enabled (0 otherwise).
 
     Methods:
         __call__(func): Decorates a function or class to freeze time during its execution.
@@ -620,6 +631,7 @@ class _freeze_time:
         as_kwarg: str,
         auto_tick_seconds: float,
         real_asyncio: Optional[bool],
+        preserve_fold: bool = False,
     ):
         self.time_to_freeze = _parse_time_to_freeze(time_to_freeze_str)
         self.tz_offset = _parse_tz_offset(tz_offset)
@@ -631,6 +643,10 @@ class _freeze_time:
         self.as_arg = as_arg
         self.as_kwarg = as_kwarg
         self.real_asyncio = real_asyncio
+        if preserve_fold and isinstance(time_to_freeze_str, real_datetime):
+            self.fold = time_to_freeze_str.fold
+        else:
+            self.fold = 0
 
     # mypy objects to this because Type is Callable, but Pytype needs it because
     # (unlike mypy's) its inference does not assume class decorators always leave
@@ -754,6 +770,7 @@ class _freeze_time:
         tz_offsets.append(self.tz_offset)
         ignore_lists.append(self.ignore)
         tick_flags.append(self.tick)
+        folds.append(self.fold)
 
         if is_already_started:
             return freeze_factory
@@ -854,6 +871,7 @@ class _freeze_time:
         ignore_lists.pop()
         tick_flags.pop()
         tz_offsets.pop()
+        folds.pop()
 
         if not freeze_factories:
             datetime.datetime = real_datetime  # type: ignore[misc]
@@ -954,7 +972,7 @@ class _freeze_time:
 
 
 def freeze_time(time_to_freeze: Optional[_Freezable]=None, tz_offset: Union[int, datetime.timedelta]=0, ignore: Optional[List[str]]=None, tick: bool=False, as_arg: bool=False, as_kwarg: str='',
-                auto_tick_seconds: float=0, real_asyncio: bool=False) -> _freeze_time:
+                auto_tick_seconds: float=0, real_asyncio: bool=False, preserve_fold: bool=False) -> _freeze_time:
     """
     Freezes time for testing purposes.
 
@@ -971,6 +989,9 @@ def freeze_time(time_to_freeze: Optional[_Freezable]=None, tz_offset: Union[int,
         as_kwarg (str): The name of the keyword argument to pass the frozen time to the decorated function.
         auto_tick_seconds (float): The number of seconds to auto-tick the frozen time.
         real_asyncio (bool): Whether to allow asyncio event loops to see real monotonic time.
+        preserve_fold (bool): Whether to keep the ``fold`` attribute of an explicitly frozen
+            timezone-aware datetime when converting the frozen time back with ``now(tz)``,
+            so the UTC instant is not shifted again for ambiguous (repeated) local times.
 
     Returns:
         _freeze_time: An instance of the _freeze_time class.
@@ -989,14 +1010,14 @@ def freeze_time(time_to_freeze: Optional[_Freezable]=None, tz_offset: Union[int,
         raise SystemError('Calling freeze_time with tick=True is only compatible with CPython')
 
     if isinstance(time_to_freeze, types.FunctionType):
-        return freeze_time(time_to_freeze(), tz_offset, ignore, tick, as_arg, as_kwarg, auto_tick_seconds, real_asyncio=real_asyncio)
+        return freeze_time(time_to_freeze(), tz_offset, ignore, tick, as_arg, as_kwarg, auto_tick_seconds, real_asyncio=real_asyncio, preserve_fold=preserve_fold)
 
     if isinstance(time_to_freeze, types.GeneratorType):
-        return freeze_time(next(time_to_freeze), tz_offset, ignore, tick, as_arg, as_kwarg, auto_tick_seconds, real_asyncio=real_asyncio)
+        return freeze_time(next(time_to_freeze), tz_offset, ignore, tick, as_arg, as_kwarg, auto_tick_seconds, real_asyncio=real_asyncio, preserve_fold=preserve_fold)
 
     if MayaDT is not None and isinstance(time_to_freeze, MayaDT):
         return freeze_time(time_to_freeze.datetime(), tz_offset, ignore,
-                           tick, as_arg, as_kwarg, auto_tick_seconds, real_asyncio=real_asyncio)
+                           tick, as_arg, as_kwarg, auto_tick_seconds, real_asyncio=real_asyncio, preserve_fold=preserve_fold)
 
     if ignore is None:
         ignore = []
@@ -1004,7 +1025,7 @@ def freeze_time(time_to_freeze: Optional[_Freezable]=None, tz_offset: Union[int,
     if config.settings.default_ignore_list:
         ignore.extend(config.settings.default_ignore_list)
 
-    return _freeze_time(
+    freeze_kwargs: Dict[str, Any] = dict(
         time_to_freeze_str=time_to_freeze,
         tz_offset=tz_offset,
         ignore=ignore,
@@ -1014,6 +1035,11 @@ def freeze_time(time_to_freeze: Optional[_Freezable]=None, tz_offset: Union[int,
         auto_tick_seconds=auto_tick_seconds,
         real_asyncio=real_asyncio,
     )
+    if preserve_fold:
+        # Only pass the new option along when it is enabled, so the original
+        # _freeze_time interface keeps being used unchanged otherwise.
+        freeze_kwargs["preserve_fold"] = preserve_fold
+    return _freeze_time(**freeze_kwargs)  # type: ignore[arg-type]
 
 
 # Setup adapters for sqlite

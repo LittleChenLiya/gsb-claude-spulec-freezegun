@@ -1,6 +1,14 @@
 Freezegun Changelog
 ===================
 
+Unreleased
+----------
+ * Add a ``preserve_fold`` option to ``freeze_time``: an explicitly frozen
+   timezone-aware datetime keeps its ``fold`` marker through ``now(tz)``
+   conversions, so ambiguous (repeated) local times no longer shift the UTC
+   instant by an extra hour. Nested freezes restore the outer fold marker and
+   the original interface is unchanged when the option is not enabled.
+
 1.5.5
 -----
  * Allow parametrized arguments called 'func' (Broken in 1.5.4)
